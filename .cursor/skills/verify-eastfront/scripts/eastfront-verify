@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+# Drive an isolated copy of eastfront-1941. Never reads or writes the checkout's
+# live/state.json except to hash it and to copy it once into the instance.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO="${EASTFRONT_REPO:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}"
+PY="$REPO/.venv/bin/python"
+FONT_DIR="/usr/share/fonts/truetype/sand-box/google/Nanum Gothic"
+
+die() { echo "eastfront-verify: $*" >&2; exit 1; }
+
+run_dir() {
+  [ -n "${EASTFRONT_VERIFY_RUN:-}" ] || die "EASTFRONT_VERIFY_RUN is unset; run launch and export the line it prints"
+  printf '%s\n' "$EASTFRONT_VERIFY_RUN"
+}
+
+instance_dir() { printf '%s/instance\n' "$(run_dir)"; }
+evidence_dir() { printf '%s/evidence\n' "$(run_dir)"; }
+netlog() { printf '%s/network.log\n' "$(run_dir)"; }
+
+source_hash() { sha256sum "$REPO/live/state.json" | awk '{print $1}'; }
+
+assert_source_untouched() {
+  local saved have
+  saved="$(cat "$(run_dir)/source-state.sha256")"
+  have="$(source_hash)"
+  [ "$saved" = "$have" ] || die "checkout live/state.json changed ($saved -> $have)"
+}
+
+assert_not_the_checkout() {
+  local inst repo
+  inst="$(readlink -f "$(instance_dir)/live/state.json")"
+  repo="$(readlink -f "$REPO/live/state.json")"
+  [ "$inst" != "$repo" ] || die "instance state is the checkout state"
+}
+
+export_shim_path() { export PATH="$(run_dir)/bin:$PATH"; }
+
+net_bytes() {
+  local f
+  f="$(netlog)"
+  [ -f "$f" ] || { echo 0; return; }
+  wc -c <"$f" | tr -d ' '
+}
+
+assert_network_silent() {
+  local before="$1" after
+  after="$(net_bytes)"
+  [ "$before" = "$after" ] || die "curl ran during a verification command (see $(netlog))"
+  [ ! -e "$(instance_dir)/live/.publish/brewpage.json" ] || die "brewpage.json was written"
+  if [ -f "$(instance_dir)/live/ticker.log" ] && grep -q 'brewpage' "$(instance_dir)/live/ticker.log"; then
+    die "ticker.log mentions brewpage"
+  fi
+}
+
+show_clock_line() {
+  "$PY" - "$(instance_dir)/live/state.json" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1], encoding="utf-8"))
+c = st["clock"]
+print(f"{c['date']} hour={c['hour']} paused={st.get('paused')} status={st.get('status')}")
+PY
+}
+
+cmd_launch() {
+  [ -x "$PY" ] || die "missing $PY (python3 -m venv .venv && .venv/bin/pip install -r requirements.txt)"
+  [ -f "$REPO/live/state.json" ] || die "missing $REPO/live/state.json"
+  [ -d "$FONT_DIR" ] || die "missing map fonts at $FONT_DIR (live/render.py reads this path)"
+  if [ -z "${EASTFRONT_VERIFY_RUN:-}" ]; then
+    EASTFRONT_VERIFY_RUN="/tmp/eastfront-verify/$(date +%Y%m%d%H%M%S)-$$"
+    export EASTFRONT_VERIFY_RUN
+  fi
+  local run inst
+  run="$(run_dir)"
+  inst="$(instance_dir)"
+  [ ! -d "$inst" ] || die "instance already exists at $inst (cleanup first, or use a new EASTFRONT_VERIFY_RUN)"
+  mkdir -p "$run/bin" "$run/evidence" "$run/pids"
+  : >"$(netlog)"
+  rm -rf "$inst"
+  mkdir -p "$inst"
+  cp -a "$REPO/live" "$inst/live"
+  cp -a "$REPO/ne" "$inst/ne"
+  cp -a "$REPO/draw_map.py" "$inst/draw_map.py"
+  ln -s "$REPO/.venv" "$inst/.venv"
+  rm -rf "$inst/live/__pycache__" "$inst/live/site" "$inst/live/.publish" \
+    "$inst/live/cache" "$inst/live/snapshots" "$inst/live/maps_archive"
+  rm -f "$inst/live/ticker.pid" "$inst/live/ticker.log" "$inst/live/.tick.lock"
+  "$PY" - "$inst/live/resume.sh" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+text = p.read_text(encoding="utf-8")
+old = '"$PY" "$LIVE/tick.py" --site-only >>"$LIVE/ticker.log"'
+new = '"$PY" "$LIVE/tick.py" --site-only --no-publish >>"$LIVE/ticker.log"'
+if old not in text:
+    raise SystemExit("instance resume.sh does not have the expected tick line")
+p.write_text(text.replace(old, new, 1), encoding="utf-8")
+PY
+  cat >"$run/bin/curl" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$(netlog)"
+exit 97
+EOF
+  chmod +x "$run/bin/curl"
+  source_hash >"$run/source-state.sha256"
+  assert_not_the_checkout
+  cat >"$run/run.json" <<EOF
+{"repo": "$REPO", "instance": "$inst", "evidence": "$(evidence_dir)", "source_state_sha256": "$(cat "$run/source-state.sha256")"}
+EOF
+  echo "export EASTFRONT_VERIFY_RUN=$run"
+  echo "ready $(show_clock_line) engine=judge instance=$inst"
+}
+
+cmd_doctor() {
+  local run inst saved have nfont
+  run="$(run_dir)"
+  inst="$(instance_dir)"
+  [ -d "$inst/live" ] || die "no instance at $inst"
+  [ -x "$PY" ] || die "missing $PY"
+  assert_not_the_checkout
+  assert_source_untouched
+  saved="$(cat "$run/source-state.sha256")"
+  have="$(source_hash)"
+  [ "$saved" = "$have" ] || die "source hash mismatch"
+  [ -d "$FONT_DIR" ] || die "missing $FONT_DIR"
+  nfont="$(find "$FONT_DIR" -maxdepth 1 -name '*.ttf' | wc -l | tr -d ' ')"
+  [ "$nfont" -ge 1 ] || die "no .ttf in $FONT_DIR"
+  grep -q -- '--no-publish' "$inst/live/resume.sh" || die "instance resume.sh was not patched"
+  if grep -q -- '--site-only --no-publish' "$REPO/live/resume.sh"; then
+    die "checkout resume.sh must not carry the verification --no-publish patch"
+  fi
+  export_shim_path
+  [ "$(command -v curl)" = "$run/bin/curl" ] || die "curl shim is not first on PATH"
+  [ ! -e "$inst/live/.publish/brewpage.json" ] || die "brewpage.json present"
+  "$PY" - "$inst/live/state.json" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1], encoding="utf-8"))
+assert st.get("engine") == "judge", st.get("engine")
+assert st.get("clock", {}).get("date"), "no clock"
+PY
+  echo "ok $(show_clock_line) engine=judge source_state=unchanged network=silent fonts=ok publish=disabled instance=$inst"
+}
+
+cmd_tick() {
+  local evidence="" before out err rc clock_before
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --evidence) evidence="${2:-}"; shift 2 ;;
+      *) die "tick: unknown arg $1" ;;
+    esac
+  done
+  cmd_doctor >/dev/null
+  clock_before="$(show_clock_line)"
+  before="$(net_bytes)"
+  out="$(mktemp)"
+  err="$(mktemp)"
+  export_shim_path
+  set +e
+  "$PY" "$(instance_dir)/live/tick.py" --force --no-publish >"$out" 2>"$err"
+  rc=$?
+  set -e
+  assert_network_silent "$before"
+  assert_source_untouched
+  echo "tick_rc=$rc"
+  echo "clock_before=$clock_before"
+  echo "clock_after=$(show_clock_line)"
+  echo "stdout<<"; cat "$out"; echo ">>"
+  echo "stderr<<"; cat "$err"; echo ">>"
+  if [ -n "$evidence" ]; then
+    local dest
+    dest="$(evidence_dir)/$evidence"
+    mkdir -p "$dest"
+    cp "$out" "$dest/tick.stdout.txt"
+    cp "$err" "$dest/tick.stderr.txt"
+    printf '%s\n' "$clock_before" >"$dest/clock-before.txt"
+    show_clock_line >"$dest/clock-after.txt"
+    cp "$(netlog)" "$dest/network.log"
+    cp "$(run_dir)/source-state.sha256" "$dest/source-state.sha256"
+    {
+      echo "tick_rc=$rc"
+      echo "feature=$evidence"
+      echo "clock_before=$clock_before"
+      echo "clock_after=$(show_clock_line)"
+      echo "source_state=unchanged"
+      echo "network=silent"
+      echo "brewpage=absent"
+    } >"$dest/summary.txt"
+  fi
+  rm -f "$out" "$err"
+  [ "$rc" -eq 0 ] || die "tick exited $rc"
+}
+
+cmd_maps() {
+  local evidence="" before dest clock_before
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --evidence) evidence="${2:-}"; shift 2 ;;
+      *) die "maps: unknown arg $1" ;;
+    esac
+  done
+  cmd_doctor >/dev/null
+  clock_before="$(show_clock_line)"
+  before="$(net_bytes)"
+  export_shim_path
+  "$PY" "$(instance_dir)/live/render.py" all
+  "$PY" "$(instance_dir)/live/build_site.py"
+  assert_network_silent "$before"
+  assert_source_untouched
+  [ "$(show_clock_line)" = "$clock_before" ] || die "maps advanced the clock"
+  echo "maps_ok $(show_clock_line)"
+  find "$(instance_dir)/live/site/maps" -name '*.png' -printf '%s %p\n' | sort
+  if [ -n "$evidence" ]; then
+    dest="$(evidence_dir)/$evidence"
+    mkdir -p "$dest"
+    find "$(instance_dir)/live/site/maps" -name '*.png' -printf '%s %p\n' | sort >"$dest/maps.txt"
+    cp "$(instance_dir)/live/site/index.html" "$dest/index.html"
+    cp "$(netlog)" "$dest/network.log"
+    printf '%s\n' "$clock_before" >"$dest/clock.txt"
+  fi
+}
+
+cmd_resume() {
+  local mode="auto" evidence="" before out err rc
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      auto|broadcast|"") mode="${1:-auto}"; shift ;;
+      --evidence) evidence="${2:-}"; shift 2 ;;
+      *) die "resume: unknown arg $1" ;;
+    esac
+  done
+  [ -n "$mode" ] || mode="auto"
+  cmd_doctor >/dev/null
+  before="$(net_bytes)"
+  out="$(mktemp)"
+  err="$(mktemp)"
+  export_shim_path
+  set +e
+  bash "$(instance_dir)/live/resume.sh" "$mode" >"$out" 2>"$err"
+  rc=$?
+  set -e
+  assert_network_silent "$before"
+  assert_source_untouched
+  echo "resume_rc=$rc"
+  echo "clock_after=$(show_clock_line)"
+  echo "stdout<<"; cat "$out"; echo ">>"
+  echo "stderr<<"; cat "$err"; echo ">>"
+  if [ -n "$evidence" ]; then
+    local dest
+    dest="$(evidence_dir)/$evidence"
+    mkdir -p "$dest"
+    cp "$out" "$dest/resume.stdout.txt"
+    cp "$err" "$dest/resume.stderr.txt"
+    show_clock_line >"$dest/clock-after.txt"
+    cp "$(netlog)" "$dest/network.log"
+    {
+      echo "resume_rc=$rc"
+      echo "mode=$mode"
+      echo "clock_after=$(show_clock_line)"
+      echo "network=silent"
+    } >"$dest/summary.txt"
+  fi
+  rm -f "$out" "$err"
+  [ "$rc" -eq 0 ] || die "resume exited $rc"
+}
+
+cmd_captures() {
+  local evidence=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --evidence) evidence="${2:-}"; shift 2 ;;
+      *) die "captures: unknown arg $1" ;;
+    esac
+  done
+  cmd_doctor >/dev/null
+  assert_source_untouched
+  "$PY" - "$(instance_dir)/live/state.json" "$(instance_dir)/live/daylog.md" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1], encoding="utf-8"))
+cap = st.get("captures")
+assert isinstance(cap, dict), "captures missing"
+for axis in ("north", "center", "south"):
+    arm = cap.get(axis) or {}
+    for side in ("de", "su"):
+        cell = arm.get(side) or {}
+        for key in ("trucks", "tanks"):
+            val = cell.get(key)
+            assert isinstance(val, int) and val >= 0, (axis, side, key, val)
+text = open(sys.argv[2], encoding="utf-8").read() if __import__("os").path.exists(sys.argv[2]) else ""
+notable = any(cap[a][s]["tanks"] >= 1 or cap[a][s]["trucks"] >= 10 for a in cap for s in ("de", "su"))
+mentioned = "노획" in text
+if notable and not mentioned:
+    raise SystemExit("notable capture missing from daylog")
+print(json.dumps(cap, ensure_ascii=False, sort_keys=True))
+print(f"notable={notable} daylog_mentions_capture={mentioned}")
+PY
+  if [ -n "$evidence" ]; then
+    local dest
+    dest="$(evidence_dir)/$evidence"
+    mkdir -p "$dest"
+    "$PY" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1],encoding="utf-8")).get("captures"), ensure_ascii=False, indent=1))' \
+      "$(instance_dir)/live/state.json" >"$dest/captures.json"
+  fi
+}
+
+cmd_publish_skip() {
+  local evidence="" before dest
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --evidence) evidence="${2:-}"; shift 2 ;;
+      *) die "publish-skip: unknown arg $1" ;;
+    esac
+  done
+  cmd_doctor >/dev/null
+  before="$(net_bytes)"
+  export_shim_path
+  # Rebuild the spectator page only. --no-publish is the gate in tick.py main().
+  "$PY" "$(instance_dir)/live/tick.py" --site-only --no-publish
+  assert_network_silent "$before"
+  assert_source_untouched
+  grep -q 'https://brewpage.app' "$(instance_dir)/live/publish.sh" || die "publish.sh lost its brewpage URL"
+  echo "publish_skip=ok network=silent brewpage=absent site=$(instance_dir)/live/site/index.html"
+  if [ -n "$evidence" ]; then
+    dest="$(evidence_dir)/$evidence"
+    mkdir -p "$dest"
+    cp "$(netlog)" "$dest/network.log"
+    printf '%s\n' "publish_skip=ok" "network=silent" "brewpage=absent" >"$dest/summary.txt"
+    # Record that publish.sh was not executed: network.log stays empty and no metadata file.
+    [ ! -e "$(instance_dir)/live/.publish/brewpage.json" ]
+    : >"$dest/publish-sh-not-executed.txt"
+  fi
+}
+
+cmd_cleanup() {
+  local run
+  run="$(run_dir)"
+  [ -d "$run" ] || die "no run at $run"
+  if [ -d "$run/pids" ]; then
+    local f pid
+    for f in "$run/pids"/*; do
+      [ -f "$f" ] || continue
+      pid="$(cat "$f")"
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+      fi
+    done
+  fi
+  rm -rf "$(instance_dir)" "$run/bin" "$run/pids"
+  echo "cleaned instance; evidence remains at $(evidence_dir)"
+}
+
+usage() {
+  echo "usage: eastfront-verify launch|doctor|show-clock|tick|maps|resume|captures|publish-skip|cleanup" >&2
+  exit 2
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    launch) cmd_launch "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    show-clock) cmd_doctor >/dev/null; show_clock_line ;;
+    tick) cmd_tick "$@" ;;
+    maps) cmd_maps "$@" ;;
+    resume) cmd_resume "$@" ;;
+    captures) cmd_captures "$@" ;;
+    publish-skip) cmd_publish_skip "$@" ;;
+    cleanup) cmd_cleanup "$@" ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"

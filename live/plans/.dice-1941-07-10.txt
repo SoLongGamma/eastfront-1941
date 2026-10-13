@@ -1,0 +1,1 @@
+north=12 center=3 south=12

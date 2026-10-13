@@ -1,0 +1,30 @@
+.venv/
+__pycache__/
+*.pyc
+
+# publish credentials and local publish state (owner token lives here)
+live/.publish/
+**/.publish/
+.env
+.env.*
+*.pem
+
+# generated runtime
+live/cache/
+live/maps_archive/
+live/snapshots/
+live/site/
+live/bin/
+live/gh-pages-repo/
+live/ticker.pid
+live/.tick.lock
+*.png
+*.log
+
+# state backups
+*.bak
+live/state.json.*
+live/*state*.bak
+
+# local import drop
+uploads/

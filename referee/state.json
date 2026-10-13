@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "updated_real": "2026-10-12T17:19:55+09:00",
+  "last_check_real": "2026-10-12T17:19:55+09:00",
+  "game_clock_seen": {
+    "date": "1941-09-05",
+    "hour": 0
+  },
+  "daylog": {
+    "path": "/workspace/eastfront/live/daylog.md",
+    "lines_seen": 21,
+    "last_line_text": "- 1941.09.04 (절차 판정) 주사위 북/중/남 13/2/6. 북: 주사위 13(기본): 루가 교두 현 전선 고수 — 견제 포격·정찰, 변화 미미. 중: 주사위 2(불리): 모길료프 포위선 야간 압박에 국지 후퇴 1km. 남: 주사위 5+1→6(기본): 비니차 회랑 연결 축 보병·기갑 합동 압박, 7km 진척. 비니차 회랑 연결 진척 3/3 — 고리 미폐쇄."
+  },
+  "processed_rounds": [],
+  "reported_flash_keys": [],
+  "notes": "Hourly check: no awaiting_orders.json; daylog +1 line (1941.09.04: 북 고수, 중 모길료프 국지후퇴 1km, 남 비니차 회랑 7km 진척, 고리 미폐쇄); no 포위완성/주요도시함락. Quiet exit."
+}
